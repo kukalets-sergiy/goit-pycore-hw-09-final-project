@@ -2,6 +2,9 @@
 
 import pickle
 import shlex
+import os
+import tempfile
+import warnings
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -22,9 +25,28 @@ class PersonalAssistant:
 
 
 def save_data(assistant, filename=DATA_FILE):
-    """Save the complete assistant state to disk."""
-    with open(filename, "wb") as file:
-        pickle.dump(assistant, file)
+    """Save the complete assistant state to disk atomically."""
+    filename = Path(filename)
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=filename.parent, prefix=f".{filename.name}.", delete=False
+        ) as file:
+            temporary_name = file.name
+            pickle.dump(assistant, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_name, filename)
+        temporary_name = None
+        directory_fd = os.open(filename.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
 
 
 def load_data(filename=DATA_FILE):
@@ -34,12 +56,31 @@ def load_data(filename=DATA_FILE):
             saved = pickle.load(file)
     except FileNotFoundError:
         return PersonalAssistant()
+    except (
+        AttributeError,
+        EOFError,
+        ImportError,
+        OSError,
+        pickle.UnpicklingError,
+        ValueError,
+    ) as error:
+        warnings.warn(
+            f"Could not load saved data from {filename}: {error}. "
+            "Starting with empty data.",
+            RuntimeWarning,
+        )
+        return PersonalAssistant()
 
     if isinstance(saved, PersonalAssistant):
         return saved
     if isinstance(saved, AddressBook):
         return PersonalAssistant(contacts=saved)
-    raise TypeError(f"Saved data in {filename} is not assistant data.")
+    warnings.warn(
+        f"Saved data in {filename} has an unsupported format. "
+        "Starting with empty data.",
+        RuntimeWarning,
+    )
+    return PersonalAssistant()
 
 
 def input_error(expected_args, usage):
@@ -220,6 +261,7 @@ def main():
                       "remove-tag, search-tag, close")
             elif command in handlers:
                 print(handlers[command](args, assistant))
+                save_data(assistant)
             else:
                 print("Invalid command. Type 'help' to see available commands.")
     finally:
